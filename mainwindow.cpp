@@ -1287,6 +1287,267 @@ void MainWindow::on_actionLoadAppconfXml_triggered()
     }
 }
 
+void MainWindow::on_actionApplyConfigurationsCAN_triggered()
+{
+    const QString title = tr("Apply Configuration XML to All VESCs");
+
+    if (!mVesc->isPortConnected()) {
+        QMessageBox::warning(this, title,
+                             tr("The VESC must be connected to perform this operation."));
+        return;
+    }
+
+    const QStringList paths = QFileDialog::getOpenFileNames(
+                this,
+                tr("Choose one motor and/or one app configuration XML file"),
+                mLastMCConfigXMLPath.isEmpty() ? mLastAppConfigXMLPath : mLastMCConfigXMLPath,
+                tr("XML files (*.xml)"));
+    if (paths.isEmpty()) {
+        return;
+    }
+
+    QStringList mcPaths;
+    QStringList appPaths;
+    QStringList invalidPaths;
+    for (const QString &path : paths) {
+        const bool isMc = ConfigParams::testXml(path, "MCConfiguration");
+        const bool isApp = ConfigParams::testXml(path, "APPConfiguration");
+        if (isMc) {
+            mcPaths.append(path);
+        }
+        if (isApp) {
+            appPaths.append(path);
+        }
+        if (!isMc && !isApp) {
+            invalidPaths.append(QFileInfo(path).fileName());
+        }
+    }
+
+    if (!invalidPaths.isEmpty()) {
+        QMessageBox::warning(
+                    this, title,
+                    tr("The following files are neither motor nor app configuration XML files:\n%1")
+                    .arg(invalidPaths.join("\n")));
+        return;
+    }
+
+    if (mcPaths.size() > 1 || appPaths.size() > 1) {
+        QMessageBox::warning(
+                    this, title,
+                    tr("Select no more than one motor configuration and no more than one app "
+                       "configuration.\n\nMotor configurations selected: %1\n"
+                       "App configurations selected: %2")
+                    .arg(mcPaths.size()).arg(appPaths.size()));
+        return;
+    }
+
+    if (mcPaths.isEmpty() && appPaths.isEmpty()) {
+        return;
+    }
+
+    const QString mcPath = mcPaths.value(0);
+    const QString appPath = appPaths.value(0);
+    if (!mcPath.isEmpty()) {
+        mLastMCConfigXMLPath = mcPath;
+    }
+    if (!appPath.isEmpty()) {
+        mLastAppConfigXMLPath = appPath;
+    }
+
+    const bool canLastFwd = mVesc->commands()->getSendCan();
+    const int canLastId = mVesc->commands()->getCanSendId();
+    const bool ignoreCanLast = mVesc->isIgnoringCanChanges();
+    const QPair<int, int> fwLast = mVesc->getFirmwareNowPair();
+
+    mVesc->ignoreCanChange(true);
+    mVesc->commands()->setSendCan(false);
+
+    FW_RX_PARAMS localFw;
+    const bool localIsVesc = Utility::getFwVersionBlocking(mVesc, &localFw)
+            && localFw.hwType == HW_TYPE_VESC;
+    QVector<int> canDevs;
+    const QVector<int> scannedCanDevs = mVesc->scanCan();
+    for (int canId : scannedCanDevs) {
+        FW_RX_PARAMS canFw;
+        if (Utility::getFwVersionBlockingCan(mVesc, &canFw, canId)
+                && canFw.hwType == HW_TYPE_VESC) {
+            canDevs.append(canId);
+        }
+    }
+    mVesc->ignoreCanChange(true);
+    mVesc->commands()->setSendCan(false);
+
+    QStringList targetNames;
+    QVector<int> targetCanIds;
+    if (localIsVesc) {
+        targetNames.append(tr("Local VESC"));
+        targetCanIds.append(-1);
+    }
+    for (int canId : canDevs) {
+        targetNames.append(tr("CAN ID %1").arg(canId));
+        targetCanIds.append(canId);
+    }
+
+    auto restoreState = [&]() {
+        mVesc->commands()->setSendCan(canLastFwd, canLastId);
+        mVesc->ignoreCanChange(ignoreCanLast);
+        if (!mVesc->getSupportedFirmwarePairs().contains(fwLast)) {
+            Utility::configLoad(mVesc, fwLast.first, fwLast.second);
+        }
+    };
+
+    if (targetCanIds.isEmpty()) {
+        restoreState();
+        QMessageBox::warning(this, title,
+                             tr("No motor controllers were found locally or on the CAN bus."));
+        return;
+    }
+
+    QStringList configNames;
+    if (!mcPath.isEmpty()) {
+        configNames.append(tr("Motor: %1").arg(QFileInfo(mcPath).fileName()));
+    }
+    if (!appPath.isEmpty()) {
+        configNames.append(tr("App: %1").arg(QFileInfo(appPath).fileName()));
+    }
+
+    const QMessageBox::StandardButton answer = QMessageBox::warning(
+                this, title,
+                tr("The following persistent configurations will be written:\n%1\n\n"
+                   "Targets:\n%2\n\n"
+                   "Each target will keep its own VESC ID and UAVCAN ESC Index. Continue?")
+                .arg(configNames.join("\n"), targetNames.join("\n")),
+                QMessageBox::Yes | QMessageBox::Cancel, QMessageBox::Cancel);
+    if (answer != QMessageBox::Yes) {
+        restoreState();
+        return;
+    }
+
+    QProgressDialog progress(tr("Applying configurations..."), tr("Cancel"),
+                             0, targetCanIds.size(), this);
+    progress.setWindowTitle(title);
+    progress.setWindowModality(Qt::WindowModal);
+    progress.setMinimumDuration(0);
+    progress.setValue(0);
+
+    QStringList results;
+    int successCount = 0;
+    bool cancelled = false;
+
+    for (int i = 0; i < targetCanIds.size(); ++i) {
+        if (progress.wasCanceled()) {
+            cancelled = true;
+            break;
+        }
+
+        const int canId = targetCanIds.at(i);
+        const QString targetName = targetNames.at(i);
+        progress.setLabelText(tr("Applying configurations to %1...").arg(targetName));
+        progress.setValue(i);
+        qApp->processEvents();
+
+        mVesc->commands()->setSendCan(canId >= 0, canId);
+
+        QString uuid;
+        if (!Utility::configLoadCompatible(mVesc, uuid)) {
+            results.append(tr("%1: FAILED - could not load a compatible configuration parser")
+                           .arg(targetName));
+            continue;
+        }
+
+        QStringList targetResults;
+        bool targetOk = true;
+
+        if (!mcPath.isEmpty()) {
+            ConfigParams *mcConfig = mVesc->mcConfig();
+            mVesc->commands()->getMcconf();
+            if (!Utility::waitSignal(mcConfig, SIGNAL(updated()), 4000)) {
+                targetResults.append(tr("Motor FAILED (read timed out)"));
+                targetOk = false;
+            } else if (!mcConfig->loadXml(mcPath, "MCConfiguration")) {
+                targetResults.append(tr("Motor FAILED (%1)").arg(mcConfig->xmlStatus()));
+                targetOk = false;
+            } else {
+                mVesc->commands()->setMcconf(false);
+                if (Utility::waitSignal(mVesc->commands(), SIGNAL(ackReceived(QString)), 4000)) {
+                    targetResults.append(tr("Motor OK"));
+                } else {
+                    targetResults.append(tr("Motor FAILED (write timed out)"));
+                    targetOk = false;
+                }
+            }
+        }
+
+        if (!appPath.isEmpty()) {
+            ConfigParams *appConfig = mVesc->appConfig();
+            mVesc->commands()->getAppConf();
+            if (!Utility::waitSignal(appConfig, SIGNAL(updated()), 4000)) {
+                targetResults.append(tr("App FAILED (read timed out)"));
+                targetOk = false;
+            } else {
+                const bool hasControllerId = appConfig->hasParam("controller_id");
+                const bool hasUavcanIndex = appConfig->hasParam("uavcan_esc_index");
+                const int controllerId = hasControllerId
+                        ? appConfig->getParamInt("controller_id") : 0;
+                const int uavcanIndex = hasUavcanIndex
+                        ? appConfig->getParamInt("uavcan_esc_index") : 0;
+
+                if (!appConfig->loadXml(appPath, "APPConfiguration")) {
+                    targetResults.append(tr("App FAILED (%1)").arg(appConfig->xmlStatus()));
+                    targetOk = false;
+                } else {
+                    if (hasControllerId) {
+                        appConfig->updateParamInt("controller_id", controllerId);
+                    }
+                    if (hasUavcanIndex) {
+                        appConfig->updateParamInt("uavcan_esc_index", uavcanIndex);
+                    }
+
+                    mVesc->commands()->setAppConf();
+                    if (Utility::waitSignal(mVesc->commands(), SIGNAL(ackReceived(QString)), 4000)) {
+                        targetResults.append(tr("App OK (VESC ID %1, UAVCAN ESC Index %2 preserved)")
+                                             .arg(hasControllerId
+                                                  ? QString::number(controllerId) : tr("N/A"),
+                                                  hasUavcanIndex
+                                                  ? QString::number(uavcanIndex) : tr("N/A")));
+                    } else {
+                        targetResults.append(tr("App FAILED (write timed out)"));
+                        targetOk = false;
+                    }
+                }
+            }
+        }
+
+        if (targetOk) {
+            ++successCount;
+        }
+        results.append(QString("%1: %2").arg(targetName, targetResults.join("; ")));
+    }
+
+    progress.setValue(targetCanIds.size());
+    restoreState();
+
+    // Refresh the configuration shown for the device that was selected before
+    // the operation without changing that selection.
+    mVesc->commands()->getMcconf();
+    mVesc->commands()->getAppConf();
+
+    const int processedCount = results.size();
+    QString summary = tr("Processed: %1 of %2\nSuccessful: %3\nFailed: %4")
+            .arg(processedCount).arg(targetCanIds.size()).arg(successCount)
+            .arg(processedCount - successCount);
+    if (cancelled) {
+        summary += tr("\nCancelled before all targets were processed.");
+    }
+    summary += "\n\n" + results.join("\n");
+
+    if (successCount == processedCount && !cancelled) {
+        QMessageBox::information(this, title, summary);
+    } else {
+        QMessageBox::warning(this, title, summary);
+    }
+}
+
 void MainWindow::on_actionExit_triggered()
 {
     qApp->exit();

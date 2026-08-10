@@ -116,6 +116,7 @@ private slots:
     void on_actionLoadMotorConfXml_triggered();
     void on_actionSaveAppconfXml_triggered();
     void on_actionLoadAppconfXml_triggered();
+    void on_actionApplyConfigurationsCAN_triggered();
     void on_actionExit_triggered();
     #ifndef Q_OS_IOS
     void on_actionLaunchBoardConfigurator_triggered();

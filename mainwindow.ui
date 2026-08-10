@@ -616,6 +616,7 @@
     <addaction name="separator"/>
     <addaction name="actionSaveAppconfXml"/>
     <addaction name="actionLoadAppconfXml"/>
+    <addaction name="actionApplyConfigurationsCAN"/>
     <addaction name="separator"/>
     <addaction name="actionSaveMotorConfigurationHeader"/>
     <addaction name="actionSaveMotorConfigurationHeaderWrap"/>
@@ -833,6 +834,14 @@
   <action name="actionLoadAppconfXml">
    <property name="text">
     <string>Load App Configuration XML</string>
+   </property>
+  </action>
+  <action name="actionApplyConfigurationsCAN">
+   <property name="text">
+    <string>Apply Configuration XML to All VESCs...</string>
+   </property>
+   <property name="toolTip">
+    <string>Apply one motor and/or one app configuration XML to the local VESC and all VESCs on the CAN bus</string>
    </property>
   </action>
   <action name="actionExit">
