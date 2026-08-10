@@ -242,6 +242,9 @@ private:
                      bool indented = false);
     void saveParamFileDialog(QString conf, bool wrapIfdef);
     void showPage(const QString &name);
+    void setupKeyboardShortcuts();
+    void showCommandPalette();
+    void navigatePage(int direction);
     void reloadPages();
     void checkUdev();
 #ifdef Q_OS_LINUX

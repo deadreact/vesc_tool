@@ -28,6 +28,9 @@
 #include <QPushButton>
 #include <QFileSelector>
 #include <QMainWindow>
+#include <QAction>
+#include <QKeySequence>
+#include <QTableWidget>
 
 #include "vescinterface.h"
 #include "widgets/paramtable.h"
@@ -60,6 +63,7 @@ public:
     void setVesc(VescInterface *vesc);
     void setUseGamepadControl(bool useControl);
     bool isUsingGamepadControl();
+    void setShortcutActions(const QList<QAction *> &actions);
 
 protected:
     void closeEvent(QCloseEvent *event);
@@ -108,7 +112,15 @@ private:
     double mLastScaling;
     bool mLastIsDark;
 
+    QList<QAction *> mShortcutActions;
+    QTableWidget *mShortcutTable;
+    QLabel *mShortcutStatusLabel;
+    QPushButton *mShortcutClearButton;
+    QPushButton *mShortcutRestoreButton;
+
     void saveSettingsChanged();
+    void populateShortcutTable();
+    bool applyShortcutEdits();
 
 };
 

@@ -29,6 +29,13 @@
 #include <QEventLoop>
 #include <QDesktopServices>
 #include <QProgressDialog>
+#include <QDialog>
+#include <QDialogButtonBox>
+#include <QLineEdit>
+#include <QListWidget>
+#include <QShortcut>
+#include <QVBoxLayout>
+#include <functional>
 #include "parametereditor.h"
 #include "startupwizard.h"
 #include "widgets/experimentplot.h"
@@ -218,6 +225,7 @@ MainWindow::MainWindow(QWidget *parent) :
     mVesc = new VescInterface(this);
     mPreferences = new Preferences(this);
     mPreferences->setVesc(mVesc);
+    setupKeyboardShortcuts();
 
     mStatusInfoTime = 0;
     mStatusLabel = new QLabel(this);
@@ -605,6 +613,12 @@ bool MainWindow::eventFilter(QObject *object, QEvent *e)
     }
 
     if (!ui->actionKeyboardControl->isChecked()) {
+        return false;
+    }
+
+    // Modified navigation shortcuts must never be interpreted as motor
+    // control input. In particular, Ctrl+PageDown changes the current page.
+    if (keyEvent->modifiers() & (Qt::ControlModifier | Qt::AltModifier | Qt::MetaModifier)) {
         return false;
     }
 
@@ -1412,6 +1426,219 @@ void MainWindow::showPage(const QString &name)
         if (p->name() == name) {
             ui->pageList->setCurrentRow(i);
             break;
+        }
+    }
+}
+
+void MainWindow::setupKeyboardShortcuts()
+{
+    // Mnemonics make every top-level menu reachable with Alt+letter. Once a
+    // menu is open, the standard arrow keys and Enter provide full keyboard
+    // access to all of its actions.
+    ui->menuFile->setTitle(tr("&File"));
+    ui->menuCommands->setTitle(tr("&Edit"));
+    ui->menuTools_2->setTitle(tr("Conf &Backup"));
+    ui->menuWizards->setTitle(tr("&Wizards"));
+    ui->menuTerminal->setTitle(tr("&Terminal"));
+    ui->menuTools->setTitle(tr("&Developer"));
+    ui->menuHelp->setTitle(tr("&Help"));
+
+    ui->actionReconnect->setShortcut(QKeySequence(Qt::Key_F5));
+    ui->actionDisconnect->setShortcut(QKeySequence(QStringLiteral("Ctrl+Shift+D")));
+    ui->actionPreferences->setShortcut(QKeySequence(QStringLiteral("Ctrl+,")));
+    ui->actionExit->setShortcut(QKeySequence::Quit);
+
+    QAction *commandPaletteAction = new QAction(tr("Command Palette..."), this);
+    commandPaletteAction->setObjectName("actionCommandPalette");
+    commandPaletteAction->setShortcut(QKeySequence(QStringLiteral("Ctrl+Shift+P")));
+    commandPaletteAction->setToolTip(tr("Search and run any menu command"));
+    connect(commandPaletteAction, &QAction::triggered,
+            this, &MainWindow::showCommandPalette);
+
+    QAction *focusNavigationAction = new QAction(tr("Focus Page Navigation"), this);
+    focusNavigationAction->setObjectName("actionFocusPageNavigation");
+    focusNavigationAction->setShortcut(QKeySequence(QStringLiteral("Ctrl+Shift+L")));
+    connect(focusNavigationAction, &QAction::triggered, this, [this]() {
+        ui->pageList->setFocus(Qt::ShortcutFocusReason);
+        if (ui->pageList->currentItem()) {
+            ui->pageList->scrollToItem(ui->pageList->currentItem());
+        }
+    });
+
+    QAction *previousPageAction = new QAction(tr("Previous Page"), this);
+    previousPageAction->setObjectName("actionPreviousPage");
+    previousPageAction->setShortcut(QKeySequence(QStringLiteral("Ctrl+PgUp")));
+    connect(previousPageAction, &QAction::triggered, this, [this]() {
+        navigatePage(-1);
+    });
+
+    QAction *nextPageAction = new QAction(tr("Next Page"), this);
+    nextPageAction->setObjectName("actionNextPage");
+    nextPageAction->setShortcut(QKeySequence(QStringLiteral("Ctrl+PgDown")));
+    connect(nextPageAction, &QAction::triggered, this, [this]() {
+        navigatePage(1);
+    });
+
+    QAction *preferencesAction = ui->actionPreferences;
+    ui->menuCommands->insertAction(preferencesAction, commandPaletteAction);
+    ui->menuCommands->insertSeparator(preferencesAction);
+    ui->menuCommands->insertAction(preferencesAction, focusNavigationAction);
+    ui->menuCommands->insertAction(preferencesAction, previousPageAction);
+    ui->menuCommands->insertAction(preferencesAction, nextPageAction);
+    ui->menuCommands->insertSeparator(preferencesAction);
+
+    QList<QAction *> configurableActions;
+    for (QAction *action : findChildren<QAction *>(QString(), Qt::FindDirectChildrenOnly)) {
+        if (!action->isSeparator() && !action->objectName().isEmpty()
+                && !action->text().isEmpty()) {
+            const QString defaultShortcut = action->shortcut()
+                    .toString(QKeySequence::PortableText);
+            action->setProperty("defaultShortcut", defaultShortcut);
+
+            const QString settingsKey = "shortcuts/" + action->objectName();
+            if (mSettings.contains(settingsKey)) {
+                action->setShortcut(QKeySequence::fromString(
+                                        mSettings.value(settingsKey).toString(),
+                                        QKeySequence::PortableText));
+            }
+            configurableActions.append(action);
+        }
+    }
+    mPreferences->setShortcutActions(configurableActions);
+}
+
+void MainWindow::showCommandPalette()
+{
+    struct CommandEntry {
+        QString path;
+        QAction *action;
+    };
+
+    QVector<CommandEntry> commands;
+    std::function<void(QMenu *, const QString &)> collectCommands;
+    collectCommands = [&commands, &collectCommands](QMenu *menu, const QString &parentPath) {
+        QString menuTitle = menu->title();
+        menuTitle.remove('&');
+        const QString path = parentPath.isEmpty() ? menuTitle : parentPath + " > " + menuTitle;
+
+        for (QAction *action : menu->actions()) {
+            if (action->isSeparator() || !action->isVisible()) {
+                continue;
+            }
+
+            if (action->menu()) {
+                collectCommands(action->menu(), path);
+                continue;
+            }
+
+            QString actionText = action->text();
+            actionText.remove('&');
+            if (!actionText.isEmpty()) {
+                commands.append({path + " > " + actionText, action});
+            }
+        }
+    };
+
+    for (QAction *menuAction : ui->menuBar->actions()) {
+        if (menuAction->menu()) {
+            collectCommands(menuAction->menu(), QString());
+        }
+    }
+
+    QDialog dialog(this);
+    dialog.setWindowTitle(tr("Command Palette"));
+    dialog.resize(620, 420);
+
+    QVBoxLayout *layout = new QVBoxLayout(&dialog);
+    QLineEdit *filterEdit = new QLineEdit(&dialog);
+    filterEdit->setPlaceholderText(tr("Type to search menu commands..."));
+    filterEdit->setClearButtonEnabled(true);
+    QListWidget *commandList = new QListWidget(&dialog);
+    commandList->setUniformItemSizes(true);
+    QDialogButtonBox *buttons = new QDialogButtonBox(QDialogButtonBox::Cancel, &dialog);
+    layout->addWidget(filterEdit);
+    layout->addWidget(commandList);
+    layout->addWidget(buttons);
+
+    auto refreshCommands = [commands, commandList](const QString &filter) {
+        commandList->clear();
+        for (int i = 0; i < commands.size(); ++i) {
+            const CommandEntry &command = commands.at(i);
+            if (!command.path.contains(filter, Qt::CaseInsensitive)) {
+                continue;
+            }
+
+            QString label = command.path;
+            if (!command.action->shortcut().isEmpty()) {
+                label += "\t" + command.action->shortcut().toString(QKeySequence::NativeText);
+            }
+
+            QListWidgetItem *item = new QListWidgetItem(label, commandList);
+            item->setData(Qt::UserRole, i);
+            if (!command.action->isEnabled()) {
+                item->setFlags(item->flags() & ~Qt::ItemIsEnabled);
+            }
+        }
+
+        if (commandList->count() > 0) {
+            commandList->setCurrentRow(0);
+        }
+    };
+
+    QAction *selectedAction = nullptr;
+    auto chooseCurrentCommand = [&dialog, &commands, commandList, &selectedAction]() {
+        QListWidgetItem *item = commandList->currentItem();
+        if (!item || !(item->flags() & Qt::ItemIsEnabled)) {
+            return;
+        }
+
+        const int index = item->data(Qt::UserRole).toInt();
+        if (index >= 0 && index < commands.size()) {
+            selectedAction = commands.at(index).action;
+            dialog.accept();
+        }
+    };
+
+    connect(filterEdit, &QLineEdit::textChanged, &dialog, refreshCommands);
+    connect(filterEdit, &QLineEdit::returnPressed, &dialog, chooseCurrentCommand);
+    connect(commandList, &QListWidget::itemActivated, &dialog,
+            [&chooseCurrentCommand](QListWidgetItem *) { chooseCurrentCommand(); });
+    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+
+    QShortcut *moveUp = new QShortcut(QKeySequence(Qt::Key_Up), filterEdit);
+    connect(moveUp, &QShortcut::activated, &dialog, [commandList]() {
+        commandList->setCurrentRow(qMax(0, commandList->currentRow() - 1));
+    });
+    QShortcut *moveDown = new QShortcut(QKeySequence(Qt::Key_Down), filterEdit);
+    connect(moveDown, &QShortcut::activated, &dialog, [commandList]() {
+        commandList->setCurrentRow(qMin(commandList->count() - 1,
+                                        commandList->currentRow() + 1));
+    });
+
+    refreshCommands(QString());
+    filterEdit->setFocus();
+    dialog.exec();
+
+    if (selectedAction && selectedAction->isEnabled()) {
+        QTimer::singleShot(0, selectedAction, &QAction::trigger);
+    }
+}
+
+void MainWindow::navigatePage(int direction)
+{
+    const int count = ui->pageList->count();
+    if (count == 0 || direction == 0) {
+        return;
+    }
+
+    const int current = qMax(0, ui->pageList->currentRow());
+    for (int offset = 1; offset <= count; ++offset) {
+        const int row = (current + direction * offset + count * 2) % count;
+        QListWidgetItem *item = ui->pageList->item(row);
+        if (item && !item->isHidden()) {
+            ui->pageList->setCurrentRow(row);
+            ui->pageList->scrollToItem(item);
+            return;
         }
     }
 }

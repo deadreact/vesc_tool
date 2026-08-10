@@ -22,6 +22,11 @@
 #include <QDebug>
 #include <cmath>
 #include <QFileDialog>
+#include <QHeaderView>
+#include <QKeySequenceEdit>
+#include <QHBoxLayout>
+#include <QVBoxLayout>
+#include <algorithm>
 #include "utility.h"
 
 Preferences::Preferences(QWidget *parent) :
@@ -41,6 +46,63 @@ Preferences::Preferences(QWidget *parent) :
             this, SLOT(timerSlot()));
 
     ui->setupUi(this);
+
+    QWidget *shortcutTab = new QWidget(ui->tabWidget);
+    QVBoxLayout *shortcutLayout = new QVBoxLayout(shortcutTab);
+    QLabel *shortcutHelp = new QLabel(
+                tr("Select a shortcut field and press the desired key combination. "
+                   "Backspace clears the current combination."), shortcutTab);
+    shortcutHelp->setWordWrap(true);
+    shortcutLayout->addWidget(shortcutHelp);
+
+    mShortcutTable = new QTableWidget(shortcutTab);
+    mShortcutTable->setColumnCount(2);
+    mShortcutTable->setHorizontalHeaderLabels({tr("Command"), tr("Shortcut")});
+    mShortcutTable->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
+    mShortcutTable->horizontalHeader()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
+    mShortcutTable->verticalHeader()->setVisible(false);
+    mShortcutTable->setSelectionBehavior(QAbstractItemView::SelectRows);
+    mShortcutTable->setSelectionMode(QAbstractItemView::SingleSelection);
+    mShortcutTable->setAlternatingRowColors(true);
+    shortcutLayout->addWidget(mShortcutTable);
+
+    QHBoxLayout *shortcutButtonLayout = new QHBoxLayout();
+    mShortcutStatusLabel = new QLabel(shortcutTab);
+    mShortcutStatusLabel->setWordWrap(true);
+    mShortcutClearButton = new QPushButton(tr("Clear Selected"), shortcutTab);
+    mShortcutRestoreButton = new QPushButton(tr("Restore Defaults"), shortcutTab);
+    shortcutButtonLayout->addWidget(mShortcutStatusLabel, 1);
+    shortcutButtonLayout->addWidget(mShortcutClearButton);
+    shortcutButtonLayout->addWidget(mShortcutRestoreButton);
+    shortcutLayout->addLayout(shortcutButtonLayout);
+    ui->tabWidget->addTab(shortcutTab, tr("Shortcuts"));
+
+    connect(mShortcutClearButton, &QPushButton::clicked, this, [this]() {
+        const int row = mShortcutTable->currentRow();
+        if (row < 0) {
+            return;
+        }
+        QKeySequenceEdit *editor = qobject_cast<QKeySequenceEdit *>(
+                    mShortcutTable->cellWidget(row, 1));
+        if (editor) {
+            editor->clear();
+            applyShortcutEdits();
+        }
+    });
+    connect(mShortcutRestoreButton, &QPushButton::clicked, this, [this]() {
+        for (int row = 0; row < mShortcutTable->rowCount(); ++row) {
+            QKeySequenceEdit *editor = qobject_cast<QKeySequenceEdit *>(
+                        mShortcutTable->cellWidget(row, 1));
+            QAction *action = mShortcutTable->item(row, 0)->data(Qt::UserRole)
+                    .value<QAction *>();
+            if (editor && action) {
+                editor->setKeySequence(QKeySequence::fromString(
+                                           action->property("defaultShortcut").toString(),
+                                           QKeySequence::PortableText));
+            }
+        }
+        applyShortcutEdits();
+    });
 
     ui->pollRestoreButton->setIcon(Utility::getIcon("icons/Restart-96.png"));
     ui->pathScriptInputChooseButton->setIcon(Utility::getIcon("icons/Open Folder-96.png"));
@@ -168,6 +230,20 @@ void Preferences::setVesc(VescInterface *vesc)
     }
 }
 
+void Preferences::setShortcutActions(const QList<QAction *> &actions)
+{
+    mShortcutActions = actions;
+    std::sort(mShortcutActions.begin(), mShortcutActions.end(),
+              [](QAction *left, QAction *right) {
+        QString leftText = left ? left->text() : QString();
+        QString rightText = right ? right->text() : QString();
+        leftText.remove('&');
+        rightText.remove('&');
+        return leftText.localeAwareCompare(rightText) < 0;
+    });
+    populateShortcutTable();
+}
+
 void Preferences::setUseGamepadControl(bool useControl)
 {
 #ifdef HAS_GAMEPAD
@@ -224,7 +300,115 @@ void Preferences::showEvent(QShowEvent *event)
         ui->qmlUiAskBox->setChecked(mVesc->askQmlLoad());
         ui->showFwUpdateBox->setChecked(mVesc->showFwUpdateAvailable());
     }
+    populateShortcutTable();
     event->accept();
+}
+
+void Preferences::populateShortcutTable()
+{
+    mShortcutTable->setRowCount(0);
+
+    for (QAction *action : mShortcutActions) {
+        if (!action) {
+            continue;
+        }
+
+        const int row = mShortcutTable->rowCount();
+        mShortcutTable->insertRow(row);
+
+        QString label = action->text();
+        label.remove('&');
+        QTableWidgetItem *nameItem = new QTableWidgetItem(label);
+        nameItem->setFlags(nameItem->flags() & ~Qt::ItemIsEditable);
+        nameItem->setData(Qt::UserRole, QVariant::fromValue(action));
+        nameItem->setToolTip(action->toolTip().isEmpty() ? action->objectName()
+                                                        : action->toolTip());
+        mShortcutTable->setItem(row, 0, nameItem);
+
+        QKeySequenceEdit *editor = new QKeySequenceEdit(action->shortcut(), mShortcutTable);
+        editor->setToolTip(tr("Press a new key combination, or Backspace to clear it"));
+        connect(editor, &QKeySequenceEdit::editingFinished,
+                this, &Preferences::applyShortcutEdits);
+        mShortcutTable->setCellWidget(row, 1, editor);
+    }
+
+    mShortcutStatusLabel->clear();
+    ui->okButton->setEnabled(true);
+    mShortcutClearButton->setEnabled(mShortcutTable->rowCount() > 0);
+}
+
+bool Preferences::applyShortcutEdits()
+{
+    QMap<QString, QList<int>> rowsByShortcut;
+
+    for (int row = 0; row < mShortcutTable->rowCount(); ++row) {
+        QKeySequenceEdit *editor = qobject_cast<QKeySequenceEdit *>(
+                    mShortcutTable->cellWidget(row, 1));
+        if (!editor) {
+            continue;
+        }
+
+        editor->setStyleSheet(QString());
+        const QString shortcut = editor->keySequence().toString(QKeySequence::PortableText);
+        if (!shortcut.isEmpty()) {
+            rowsByShortcut[shortcut].append(row);
+        }
+    }
+
+    QStringList conflicts;
+    for (auto it = rowsByShortcut.constBegin(); it != rowsByShortcut.constEnd(); ++it) {
+        if (it.value().size() < 2) {
+            continue;
+        }
+
+        QStringList commandNames;
+        for (int row : it.value()) {
+            QKeySequenceEdit *editor = qobject_cast<QKeySequenceEdit *>(
+                        mShortcutTable->cellWidget(row, 1));
+            if (editor) {
+                editor->setStyleSheet("QKeySequenceEdit { border: 1px solid #d9534f; }");
+            }
+            commandNames.append(mShortcutTable->item(row, 0)->text());
+        }
+        conflicts.append(tr("%1: %2").arg(
+                             QKeySequence::fromString(it.key(), QKeySequence::PortableText)
+                             .toString(QKeySequence::NativeText),
+                             commandNames.join(", ")));
+    }
+
+    if (!conflicts.isEmpty()) {
+        mShortcutStatusLabel->setText(tr("Resolve duplicate shortcuts: %1")
+                                      .arg(conflicts.join("; ")));
+        mShortcutStatusLabel->setStyleSheet("QLabel { color: #d9534f; }");
+        ui->okButton->setEnabled(false);
+        return false;
+    }
+
+    mShortcutStatusLabel->setText(tr("Shortcuts are applied immediately."));
+    mShortcutStatusLabel->setStyleSheet(QString());
+    ui->okButton->setEnabled(true);
+
+    for (int row = 0; row < mShortcutTable->rowCount(); ++row) {
+        QAction *action = mShortcutTable->item(row, 0)->data(Qt::UserRole)
+                .value<QAction *>();
+        QKeySequenceEdit *editor = qobject_cast<QKeySequenceEdit *>(
+                    mShortcutTable->cellWidget(row, 1));
+        if (!action || !editor) {
+            continue;
+        }
+
+        const QKeySequence shortcut = editor->keySequence();
+        action->setShortcut(shortcut);
+        const QString settingsKey = "shortcuts/" + action->objectName();
+        const QString shortcutText = shortcut.toString(QKeySequence::PortableText);
+        if (shortcutText == action->property("defaultShortcut").toString()) {
+            mSettings.remove(settingsKey);
+        } else {
+            mSettings.setValue(settingsKey, shortcutText);
+        }
+    }
+    mSettings.sync();
+    return true;
 }
 
 void Preferences::timerSlot()
